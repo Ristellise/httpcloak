@@ -19,7 +19,7 @@ Example:
 
 import asyncio
 import base64
-import json
+import json as std_json
 import mimetypes
 import os
 import platform
@@ -32,6 +32,13 @@ from pathlib import Path
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Union
 from urllib.parse import quote, urlencode
 
+# Faster json support via msgspec
+try:
+    import msgspec
+    _MSGSPEC_AVAILABLE = True
+except ImportError:
+    _MSGSPEC_AVAILABLE = False
+
 # File type for files parameter
 FileValue = Union[
     bytes,                                          # Raw bytes
@@ -43,6 +50,24 @@ FileValue = Union[
 ]
 FilesType = Dict[str, FileValue]
 
+
+
+def _json_loads(data: Union[str, bytes, bytearray, memoryview]) -> Any:
+    """Fast JSON parsing, falling back to stdlib."""
+    if _MSGSPEC_AVAILABLE:
+        # msgspec decodes bytes/memoryviews natively, skipping utf-8 string allocation
+        return msgspec.json.decode(data)
+    
+    # Standard json requires strings or bytes, but handles memoryview poorly in some versions
+    if isinstance(data, memoryview):
+        data = bytes(data)
+    return std_json.loads(data)
+
+def _json_dumps_bytes(obj: Any) -> bytes:
+    """Fast JSON encoding directly to bytes for C-lib IPC."""
+    if _MSGSPEC_AVAILABLE:
+        return msgspec.json.encode(obj)
+    return std_json.dumps(obj).encode("utf-8")
 
 def _encode_multipart(
     data: Optional[Dict[str, str]] = None,
@@ -434,7 +459,10 @@ class Response:
 
     def json(self, **kwargs) -> Any:
         """Parse response body as JSON."""
-        return json.loads(self.text, **kwargs)
+        if _MSGSPEC_AVAILABLE and not kwargs:
+            # ZERO-COPY JSON PARSING: reads straight from the Go-allocated memoryview!
+            return msgspec.json.decode(self.content)
+        return std_json.loads(self.text, **kwargs)
 
     def raise_for_status(self):
         """Raise HTTPCloakError if status_code >= 400."""
@@ -598,7 +626,9 @@ class FastResponse:
 
     def json(self, **kwargs) -> Any:
         """Parse response body as JSON (creates a copy)."""
-        return json.loads(self.text, **kwargs)
+        if _MSGSPEC_AVAILABLE and not kwargs:
+            return msgspec.json.decode(self.content)
+        return std_json.loads(self.text, **kwargs)
 
     def raise_for_status(self):
         """Raise HTTPCloakError if status_code >= 400."""
@@ -644,7 +674,7 @@ class _FastBufferPool:
             return self._buffers[tier_size], self._ctypes_ptrs[tier_size], tier_size
 
 
-# Global fast buffer pool (one per process)
+# Global fast buffer pool (one per thread)
 _fast_pool_local = threading.local()
 
 def _get_fast_buffer_pool() -> _FastBufferPool:
@@ -1301,13 +1331,13 @@ def _parse_raw_response(lib, response_handle: int, elapsed: float = 0.0) -> Resp
         if meta_ptr is None or meta_ptr == 0:
             raise HTTPCloakError("Failed to get response metadata")
 
-        meta_str = cast(meta_ptr, c_char_p).value
+        meta_bytes = cast(meta_ptr, c_char_p).value
         lib.httpcloak_free_string(meta_ptr)
 
-        if meta_str is None:
+        if meta_bytes is None:
             raise HTTPCloakError("Empty response metadata")
 
-        data = json.loads(meta_str.decode("utf-8"))
+        data = _json_loads(meta_bytes)
         if "error" in data:
             raise HTTPCloakError(data["error"])
 
@@ -1717,7 +1747,7 @@ class Session:
         if tcp_df is not None:
             config["tcp_df"] = tcp_df
 
-        config_json = json.dumps(config).encode("utf-8")
+        config_json = _json_dumps_bytes(config)
         self._handle = self._lib.httpcloak_session_new(config_json)
 
         if self._handle == 0:

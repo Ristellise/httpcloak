@@ -31,6 +31,9 @@ Documentation = "https://github.com/sardanioss/httpcloak#readme"
 Repository = "https://github.com/sardanioss/httpcloak"
 Issues = "https://github.com/sardanioss/httpcloak/issues"
 
+[project.optional-dependencies]
+fast = ["msgspec>=0.20.0"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 
